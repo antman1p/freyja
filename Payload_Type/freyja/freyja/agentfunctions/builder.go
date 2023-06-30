@@ -116,22 +116,25 @@ func build(payloadBuildMsg agentstructs.PayloadBuildMessage) agentstructs.Payloa
 			ldflags += fmt.Sprintf(" -X '%s.%s=%v'", freyja_repo_profile, key, val)
 		}
 	}
-
-	ldflags += fmt.Sprintf(" -X '%s.proxy_bypass=%v'", freyja_repo_profile, payloadBuildMsg.BuildParameters["proxy_bypass"])
+	proxyBypass, _ := payloadBuildMsg.BuildParameters.GetBooleanArg("proxy_bypass")
+	ldflags += fmt.Sprintf(" -X '%s.proxy_bypass=%v'", freyja_repo_profile, proxyBypass)
 	ldflags += " -buildid="
 	goarch := "amd64"
-	if payloadBuildMsg.BuildParameters["architecture"].(string) == "ARM_x64" {
+	architecture, _ := payloadBuildMsg.BuildParameters.GetStringArg("architecture")
+	if architecture == "ARM_x64" {
 		goarch = "arm64"
 	}
 	command := fmt.Sprintf("rm -rf /deps; CGO_ENABLED=1 GOOS=%s GOARCH=%s ", targetOs, goarch)
-	goCmd := fmt.Sprintf("-tags %s -buildmode %s -ldflags \"%s\"", payloadBuildMsg.C2Profiles[0].Name, payloadBuildMsg.BuildParameters["mode"], ldflags)
+	mode, _ := payloadBuildMsg.BuildParameters.GetStringArg("mode")
+	goCmd := fmt.Sprintf("-tags %s -buildmode %s -ldflags \"%s\"", payloadBuildMsg.C2Profiles[0].Name, mode, ldflags)
 	if targetOs == "darwin" {
 		command += "CC=o64-clang CXX=o64-clang++ "
 	} else if targetOs == "windows" {
 		command += "CC=x86_64-w64-mingw32-gcc "
 	}
 	command += "GOGARBLE=* "
-	if payloadBuildMsg.BuildParameters["garble"].(bool) {
+	garble, _ := payloadBuildMsg.BuildParameters.GetBooleanArg("garble")
+	if garble {
 		command += "/go/bin/garble -tiny -literals -debug -seed random build "
 	} else {
 		command += "go build "
@@ -144,7 +147,7 @@ func build(payloadBuildMsg agentstructs.PayloadBuildMessage) agentstructs.Payloa
 	}
 	command += fmt.Sprintf("-%s", goarch)
 	payloadName += fmt.Sprintf("-%s", goarch)
-	if payloadBuildMsg.BuildParameters["mode"].(string) == "c-shared" {
+	if mode == "c-shared" {
 		if targetOs == "windows" {
 			command += ".dll"
 			payloadName += ".dll"
@@ -155,10 +158,66 @@ func build(payloadBuildMsg agentstructs.PayloadBuildMessage) agentstructs.Payloa
 			command += ".so"
 			payloadName += ".so"
 		}
-	} else if payloadBuildMsg.BuildParameters["mode"].(string) == "c-archive" {
+	} else if mode == "c-archive" {
 		command += ".a"
 		payloadName += ".a"
 	}
+
+	mythicrpc.SendMythicRPCPayloadUpdateBuildStep(mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
+		PayloadUUID: payloadBuildMsg.PayloadUUID,
+		StepName:    "Configuring",
+		StepSuccess: true,
+		StepStdout:  fmt.Sprintf("Successfully configured\n%s", command),
+	})
+	cmd := exec.Command("/bin/bash")
+	cmd.Stdin = strings.NewReader(command)
+	cmd.Dir = "./freyja/agent_code/"
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		payloadBuildResponse.Success = false
+		payloadBuildResponse.BuildMessage = "Compilation failed with errors"
+		payloadBuildResponse.BuildStdErr = stderr.String() + "\n" + err.Error()
+		payloadBuildResponse.BuildStdOut = stdout.String()
+		mythicrpc.SendMythicRPCPayloadUpdateBuildStep(mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
+			PayloadUUID: payloadBuildMsg.PayloadUUID,
+			StepName:    "Compiling",
+			StepSuccess: false,
+			StepStdout:  fmt.Sprintf("failed to compile\n%s\n%s\n%s", stderr.String(), stdout.String(), err.Error()),
+		})
+		return payloadBuildResponse
+	} else {
+		outputString := stdout.String()
+		if !garble {
+			// only adding stderr if garble is false, otherwise it's too much data
+			outputString += "\n" + stderr.String()
+		}
+
+		mythicrpc.SendMythicRPCPayloadUpdateBuildStep(mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
+			PayloadUUID: payloadBuildMsg.PayloadUUID,
+			StepName:    "Compiling",
+			StepSuccess: true,
+			StepStdout:  fmt.Sprintf("Successfully executed\n%s", outputString),
+		})
+	}
+	if !garble {
+		payloadBuildResponse.BuildStdErr = stderr.String()
+	}
+	payloadBuildResponse.BuildStdOut = stdout.String()
+	if payloadBytes, err := os.ReadFile(fmt.Sprintf("/build/%s", payloadName)); err != nil {
+		payloadBuildResponse.Success = false
+		payloadBuildResponse.BuildMessage = "Failed to find final payload"
+	} else {
+		payloadBuildResponse.Payload = &payloadBytes
+		payloadBuildResponse.Success = true
+		payloadBuildResponse.BuildMessage = "Successfully built payload!"
+	}
+
+	//payloadBuildResponse.Status = agentstructs.PAYLOAD_BUILD_STATUS_ERROR
+	return payloadBuildResponse
+}
 
 	mythicrpc.SendMythicRPCPayloadUpdateBuildStep(mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
 		PayloadUUID: payloadBuildMsg.PayloadUUID,
